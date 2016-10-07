@@ -55,6 +55,27 @@ filterOutRelativeDirectories = filter (\name -> ((name /= ".") && (name /= "..")
 getFullPathDirectoryContents :: FilePath -> IO [FilePath]
 getFullPathDirectoryContents directory = ((map ((</>) directory)) . filterOutRelativeDirectories) <$> (getDirectoryContents directory)
 
+throwErrorOnTrue :: Bool -> String -> ExitCode -> ExceptT (String,ExitCode) IO ()
+throwErrorOnTrue True errorMessage exitCode = throwError (errorMessage,exitCode)
+throwErrorOnTrue False _ _ = return ()
+
+throwErrorOnTrueIO :: IO Bool -> String -> ExitCode -> ExceptT (String,ExitCode) IO ()
+throwErrorOnTrueIO action errorMessage exitCode = do
+  resultBool <- liftIO action
+  if resultBool
+    then throwError (errorMessage,exitCode)
+    else return ()
+
+throwErrorOnNothingIO :: IO (Maybe a) -> String -> ExitCode -> ExceptT (String,ExitCode) IO a
+throwErrorOnNothingIO action errorMessage exitCode = do
+  result <- liftIO action
+  case result of
+    Just x -> return x
+    Nothing -> throwError (errorMessage,exitCode)
+
+exitSuccess = ExitSuccess
+exitFailure = ExitFailure (-1)
+
 main :: IO ()
 main = do
   args <- getArgs
@@ -63,47 +84,23 @@ main = do
   tempDir <- liftIO $ mkdtemp "/tmp/"
   result <- runExceptT $ do
     -- make sure arguments are the right length (output file, and input directory)
-    if ((length args) /= 2)
-      then throwError (("Usage: " ++ progName ++ " output.pdf inputDirectory"),ExitSuccess)
-      else return ()
+    throwErrorOnTrue ((length args) /= 2) ("Usage: " ++ progName ++ " output.pdf inputDirectory") exitSuccess
     let [outputFile,inputDirectory] = args
     -- make sure first argument doesn't already exist
-    outputFileExists <- liftIO $ fileExist outputFile
-    if outputFileExists
-      then throwError (("Error: output file " ++ outputFile ++ " already exists"),ExitFailure (-1))
-      else return ()
+    throwErrorOnTrueIO (fileExist outputFile) ("Error: output file " ++ outputFile ++ " already exists") exitFailure
     -- make sure second argument points to directory
-    inputDirectoryExists <- liftIO $ fileExist inputDirectory
-    if (not inputDirectoryExists)
-      then throwError (("Error: input directory " ++ inputDirectory ++ " does not exist"),ExitFailure (-1))
-      else return ()
-    inputDirectoryStatus <- liftIO $ getSymbolicLinkStatus inputDirectory
-    if (not (isDirectory inputDirectoryStatus))
-      then throwError (("Error: input directory " ++ inputDirectory ++ " is not a directory"),ExitFailure (-1))
-      else return ()
+    throwErrorOnTrueIO (not <$> (fileExist inputDirectory)) ("Error: input directory " ++ inputDirectory ++ " does not exist") exitFailure
+    throwErrorOnTrueIO ((not . isDirectory) <$> (getSymbolicLinkStatus inputDirectory)) ("Error: input directory " ++ inputDirectory ++ " is not a directory") exitFailure
     -- make sure the ImageMagick "convert" program is callable
-    convertFilePath <- do
-      maybeConvert <- liftIO $ findExecutable "convert"
-      case maybeConvert of
-        Nothing -> throwError (("Error: ImageMagic utility \"convert\" cannot be found"),ExitFailure (-1))
-        Just convertPath -> return $ convertPath
+    convertFilePath <- throwErrorOnNothingIO (findExecutable "convert") ("Error: ImageMagick utility \"convert\" cannot be found") exitFailure
     -- make sure the "pdfunite" program is callable
-    pdfUniteFilePath <- do
-      maybePDFUnite <- liftIO $ findExecutable "pdfunite"
-      case maybePDFUnite of
-        Nothing -> throwError (("Error: utility \"pdfunite\" cannot be found"),ExitFailure (-1))
-        Just pdfUnitePath -> return $ pdfUnitePath
+    pdfUniteFilePath <- throwErrorOnNothingIO (findExecutable "pdfunite") ("Error: utility \"pdfunite\" cannot be found") exitFailure
     -- get listing of directory
     inputDirListing <- liftIO $ getFullPathDirectoryContents inputDirectory
     -- make sure there are 1 or 2 items in the input directory
-    if (((length inputDirListing) /= 1) && ((length inputDirListing) /= 2))
-      then throwError (("Error: there must be one or two directories in the input directory"),ExitFailure (-1))
-      else return ()
+    throwErrorOnTrue (((length inputDirListing) /= 1) && ((length inputDirListing) /= 2)) ("Error: there must be one or two directories in the input directory") exitFailure
     -- make sure those items are themselves directories
-    allDirectories <- liftIO $ allFileType isDirectory inputDirListing
-    if (not allDirectories)
-      then throwError ("Error: not all files in the input directory are themselves directories",ExitFailure (-1))
-      else return ()
+    throwErrorOnTrueIO (not <$> (allFileType isDirectory inputDirListing)) ("Error: not all files in the input directory are themselves directories") exitFailure
     -- combine the odd and even files together
     filesList <- do
       let (oddDirPath:evenDirPath) = map (inputDirectory </>) (sort inputDirListing)
@@ -115,16 +112,11 @@ main = do
       let oddDirLength = length oddDirListing
           evenDirLength = length evenDirListing
       -- the odd directory should contain the same number, or one more, of the files than the even directory
-      if (not ((oddDirLength == evenDirLength) || (oddDirLength == (evenDirLength+1))))
-        then throwError ("Error: number of files in odd directory is not the same or one more than the number of files in the even directory",ExitFailure (-1))
-        else return ()
+      throwErrorOnTrue (not ((oddDirLength == evenDirLength) || (oddDirLength == (evenDirLength+1)) || (evenDirLength == 0))) ("Error: number of files in odd directory is not the same or one more than the number of files in the even directory") exitFailure
       -- interlace the odd and even files together
       return $ interlace oddDirListing evenDirListing
     -- make sure each item is a file, and not a directory
-    allFiles <- liftIO $ allFileType isRegularFile filesList
-    if (not allFiles)
-      then throwError ("Error: not all files in the image directories are files",ExitFailure (-1))
-      else return ()
+    throwErrorOnTrueIO (not <$> (allFileType isRegularFile filesList)) ("Error: not all files in the image directories are files") exitFailure
     -- process the images in parallel, calling the ImageMagick "convert" command, and output the files to sequential numbers in the temporary directory.  Stop the parallel pool right after.
     let blackLevel = 50 :: Int
         whiteLevel = 100 :: Int
@@ -138,16 +130,12 @@ main = do
     liftIO $ putStrLn "done"
     liftIO $ stopGlobalPool
     let failedConversions = filter (\(exitCode,_,_) -> (exitCode /= ExitSuccess)) returnValues
-    if ((length failedConversions) /= 0)
-      then throwError ("Error in converting images: " ++ (show failedConversions),ExitFailure (-1))
-      else return ()
+    throwErrorOnTrue ((length failedConversions) /= 0) ("Error in converting images: " ++ (show failedConversions)) exitFailure
     -- call pdfunite on the temporary directory and write final PDF file to output file
     liftIO $ putStrLn "saving PDF"
     (exitCode, stdout, stderr) <- liftIO $ readProcessWithExitCode pdfUniteFilePath ((map (\number -> tempDir </> (show number) <.> "pdf") [1..(length filesList)]) ++ [outputFile]) ""
     liftIO $ putStrLn "done"
-    if exitCode /= ExitSuccess
-      then throwError $ (unlines ["Error in saving images to PDF:",stdout,stderr],ExitFailure (-1))
-      else return ()
+    throwErrorOnTrue (exitCode /= ExitSuccess) (unlines ["Error in saving images to PDF:",stdout,stderr]) exitFailure
     return ()
   -- recursively delete the temporary directory
   liftIO $ removeDirectoryRecursive tempDir
